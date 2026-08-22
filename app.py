@@ -8,6 +8,7 @@ from threading import RLock
 from typing import Any
 
 from flask import Flask, jsonify, request
+from routes import app
 
 LOOKBACK = timedelta(hours=24)
 
@@ -275,8 +276,6 @@ class RiskEngine:
                 results.append({"txId": record.tx_id, "riskScore": score})
         return results
 
-
-app = Flask(__name__)
 engine = RiskEngine()
 
 
