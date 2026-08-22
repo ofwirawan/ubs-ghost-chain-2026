@@ -203,3 +203,7 @@ class RiskEngine:
 
         score += self._identity_signal(tx, records, graph)
         return round(min(max(score, 0.0), 1.0), 6)
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
