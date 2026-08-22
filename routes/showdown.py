@@ -96,7 +96,7 @@ def evaluate_strength(your_card: int, comm: int | None, table_rule: str) -> tupl
 
     return (total_wins / total_evals) if total_evals > 0 else 0.5, is_confident
 
-@app.route("/move", methods=["POST"])
+@app.post("/move")
 def showdown():
     data = request.get_json(silent=True) or {}
     table_rule = data.get("table_rule", "standard")
@@ -131,3 +131,7 @@ def showdown():
         return jsonify({"action": "call"})
 
     return jsonify({"action": "check" if "check" in legal_actions else "fold"})
+
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok"})
