@@ -7,6 +7,8 @@ from math import isfinite
 from threading import RLock
 from typing import Any
 
+from flask import Flask, jsonify, request
+
 LOOKBACK = timedelta(hours=24)
 
 
@@ -20,6 +22,18 @@ class Transaction:
     ip: str | None
     device: str | None
     score: float
+
+
+def parse_timestamp(value: Any) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("createdAt must be an ISO 8601 string")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("createdAt must be an ISO 8601 timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 class RiskEngine:
@@ -62,7 +76,9 @@ class RiskEngine:
         return False
 
     @classmethod
-    def _count_simple_paths(cls, graph: dict[str, set[str]], start: str, goal: str, max_depth: int = 5) -> int:
+    def _count_simple_paths(
+        cls, graph: dict[str, set[str]], start: str, goal: str, max_depth: int = 5
+    ) -> int:
         total = 0
         stack = [(start, {start})]
         while stack and total < 5:
@@ -128,41 +144,47 @@ class RiskEngine:
             index += 1
         return components
 
-    def _identity_signal(self, tx: dict[str, Any], records: list[Transaction], graph: dict[str, set[str]]) -> float:
+    def _identity_signal(
+        self, tx: dict[str, Any], records: list[Transaction], graph: dict[str, set[str]]
+    ) -> float:
         source, target = tx["fromUserId"], tx["toUserId"]
         signal = 0.0
 
-        upstream_txs = [r for r in records if r.target == source or self._reachable(graph, r.target, source)]
+        upstream_txs = [
+            r
+            for r in records
+            if r.target == source or self._reachable(graph, r.target, source)
+        ]
         components = self._component(graph, set())
         current_comp = components.get(source)
 
         for field, attr in (("ipAddress", "ip"), ("deviceId", "device")):
             val = tx.get(field)
-            upstream_vals = {getattr(r, attr) for r in upstream_txs if getattr(r, attr) is not None}
+            upstream_vals = {
+                getattr(r, attr) for r in upstream_txs if getattr(r, attr) is not None
+            }
 
             if val is None:
-                # Trail-dropping: identity was present upstream but omitted here
                 if upstream_vals:
                     signal += 0.08
             else:
-                # Identity shift/divergence mid-flow
                 if upstream_vals and val not in upstream_vals:
                     signal += 0.06
 
-                # Cross-component reuse check
                 matching_txs = [r for r in records if getattr(r, attr) == val]
                 if matching_txs:
-                    other_comps = {components.get(r.source) for r in matching_txs} | {components.get(r.target) for r in matching_txs}
+                    other_comps = {components.get(r.source) for r in matching_txs} | {
+                        components.get(r.target) for r in matching_txs
+                    }
                     other_comps.discard(current_comp)
                     other_comps.discard(None)
 
                     if other_comps:
-                        # Shared across disconnected components
                         has_flow_link = any(
-                            self._reachable(graph, r.source, source) or self._reachable(graph, source, r.source)
+                            self._reachable(graph, r.source, source)
+                            or self._reachable(graph, source, r.source)
                             for r in matching_txs
                         )
-                        # Higher penalty if components have flow/proximity, lower hint if strictly isolated
                         signal += 0.09 if has_flow_link else 0.03
 
         return min(signal, 0.35)
@@ -175,23 +197,23 @@ class RiskEngine:
         if source == target:
             score += 0.50
 
-        existing_nodes = set(graph) | {node for targets in graph.values() for node in targets}
+        existing_nodes = set(graph) | {
+            node for targets in graph.values() for node in targets
+        }
         if source in existing_nodes or target in existing_nodes:
             score += 0.04
 
         if target in graph.get(source, set()):
             score += 0.04
 
-        # Return path scoring
         return_paths = self._count_simple_paths(graph, target, source)
         if return_paths > 0:
-            score += 0.35  # Return path completed
+            score += 0.35
             if return_paths > 1:
-                score += min(0.12 * (return_paths - 1), 0.24)  # Multi-loop return path
+                score += min(0.12 * (return_paths - 1), 0.24)
             if self._has_any_cycle(graph):
-                score += 0.10  # Pre-existing cycle in network
+                score += 0.10
         else:
-            # Convergence and path extensions
             paths_from_source = self._count_simple_paths(graph, source, target)
             if paths_from_source > 0:
                 score += min(0.06 * paths_from_source, 0.18)
@@ -199,13 +221,108 @@ class RiskEngine:
             ancestors_source = self._get_ancestors(graph, source)
             ancestors_target = self._get_ancestors(graph, target)
             if (ancestors_source & ancestors_target) - {source}:
-                score += 0.12  # Convergence
+                score += 0.12
 
         score += self._identity_signal(tx, records, graph)
         return round(min(max(score, 0.0), 1.0), 6)
 
+    def process(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        items = payload.get("transactions")
+        if not isinstance(items, list):
+            raise ValueError("transactions must be an array")
+        results = []
+        with self._lock:
+            for raw in items:
+                if not isinstance(raw, dict):
+                    raise ValueError("each transaction must be an object")
+                required = ("txId", "fromUserId", "toUserId", "amount", "createdAt")
+                if any(
+                    not isinstance(raw.get(k), str) or not raw.get(k)
+                    for k in required
+                    if k != "amount"
+                ):
+                    raise ValueError(
+                        "txId, fromUserId, toUserId, and createdAt are required strings"
+                    )
+                try:
+                    amount = float(raw["amount"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("amount must be a number") from exc
+                if not isfinite(amount) or amount < 0:
+                    raise ValueError("amount must be a finite non-negative number")
+                created_at = parse_timestamp(raw["createdAt"])
+                self._expire(created_at)
+                existing = self.by_id.get(raw["txId"])
+                fingerprint = (
+                    raw["fromUserId"],
+                    raw["toUserId"],
+                    amount,
+                    created_at,
+                    raw.get("ipAddress"),
+                    raw.get("deviceId"),
+                )
+                if existing:
+                    existing_fingerprint = (
+                        existing.source,
+                        existing.target,
+                        existing.amount,
+                        existing.created_at,
+                        existing.ip,
+                        existing.device,
+                    )
+                    if fingerprint != existing_fingerprint:
+                        raise ValueError(
+                            f"txId {raw['txId']} was already submitted with a different payload"
+                        )
+                    results.append(
+                        {"txId": existing.tx_id, "riskScore": existing.score}
+                    )
+                    continue
+                score = self._score(raw, list(self.transactions))
+                record = Transaction(
+                    raw["txId"],
+                    raw["fromUserId"],
+                    raw["toUserId"],
+                    amount,
+                    created_at,
+                    raw.get("ipAddress"),
+                    raw.get("deviceId"),
+                    score,
+                )
+                self.transactions.append(record)
+                self.by_id[record.tx_id] = record
+                results.append({"txId": record.tx_id, "riskScore": score})
+        return results
+
+
 app = Flask(__name__)
 engine = RiskEngine()
 
-if __name__ == '__main__':
-    app.run(debug=True)
+
+@app.get("/ghost-chains/health")
+def health():
+    return jsonify(status="ok")
+
+
+@app.post("/ghost-chains/reset")
+def reset():
+    body = request.get_json(silent=True) or {}
+    if body.get("clearTransactions") is not True:
+        return jsonify(error="clearTransactions must be true"), 400
+    engine.reset()
+    return jsonify(clearTransactions=True)
+
+
+@app.post("/ghost-chains/transactions")
+def transactions():
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="request body must be a JSON object"), 400
+    try:
+        return jsonify(transactions=engine.process(body))
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
