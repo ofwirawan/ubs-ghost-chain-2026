@@ -165,12 +165,9 @@ def showdown():
 @app.post("/stonks")
 def solve_stonks():
     try:
-        # Force JSON parsing even if headers are missing or non-standard
         datas = request.get_json(force=True, silent=True)
-
         if datas is None:
-            return jsonify({"error": "Invalid or missing JSON payload"}), 400
-
+            return jsonify({"error": "Invalid JSON input"}), 400
         if isinstance(datas, dict):
             datas = [datas]
 
@@ -183,22 +180,30 @@ def solve_stonks():
 
             best_profit = -1
             best_path = []
+            memo = {}
 
             def dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, phase):
                 nonlocal best_profit, best_path
 
-                # Prune: verify enough energy exists to return home to 2037
+                # Prune: verify enough energy exists to return to 2037
                 if curr_energy < abs(year - 2037):
                     return
 
-                # Record best profit achieved back at 2037
+                # State Memoization Pruning (Prunes paths that arrive with <= capital)
+                frozen_holdings = tuple(sorted((k, v) for k, v in holdings.items() if v > 0))
+                state_key = (year, curr_energy, phase, frozen_holdings)
+                if memo.get(state_key, -1) >= curr_cap:
+                    return
+                memo[state_key] = curr_cap
+
+                # Record maximum profit achieved at origin year 2037
                 if year == 2037:
                     profit = curr_cap - capital
                     if profit > best_profit:
                         best_profit = profit
                         best_path = list(path)
 
-                # PHASE 0: Sell carried holdings in current year
+                # PHASE 0: Sell carried holdings
                 if phase == 0:
                     sold_any = False
                     for stock, qty in list(holdings.items()):
@@ -206,66 +211,41 @@ def solve_stonks():
                             price = timeline_state[str(year)][stock]["price"]
                             earned = qty * price
 
-                            new_holdings = dict(holdings)
-                            new_holdings[stock] = 0
-
+                            # Sell in-place
+                            holdings[stock] = 0
                             sold_any = True
-                            dfs(
-                                year,
-                                curr_energy,
-                                curr_cap + earned,
-                                new_holdings,
-                                timeline_state,
-                                path + [f"s-{stock}-{qty}"],
-                                0,
-                            )
 
-                    # Move to Buy phase
+                            dfs(year, curr_energy, curr_cap + earned, holdings, timeline_state, path + [f"s-{stock}-{qty}"], 0)
+
+                            # Backtrack
+                            holdings[stock] = qty
+
                     if not sold_any:
-                        dfs(
-                            year,
-                            curr_energy,
-                            curr_cap,
-                            holdings,
-                            timeline_state,
-                            path,
-                            1,
-                        )
+                        dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 1)
 
-                # PHASE 1: Buy available stocks in current year
+                # PHASE 1: Buy available stocks
                 elif phase == 1:
-                    bought_any = False
                     for stock, info in timeline_state.get(str(year), {}).items():
                         price, max_qty = info["price"], info["qty"]
-                        max_affordable = min(max_qty, curr_cap // price)
+                        if price > 0 and max_qty > 0:
+                            max_affordable = min(max_qty, curr_cap // price)
+                            if max_affordable > 0:
+                                cost = max_affordable * price
 
-                        # Test max_affordable to prevent branching explosion
-                        if max_affordable > 0:
-                            bought_any = True
-                            cost = max_affordable * price
+                                # Buy in-place
+                                info["qty"] -= max_affordable
+                                holdings[stock] = holdings.get(stock, 0) + max_affordable
 
-                            new_timeline = copy.deepcopy(timeline_state)
-                            new_timeline[str(year)][stock]["qty"] -= max_affordable
+                                dfs(year, curr_energy, curr_cap - cost, holdings, timeline_state, path + [f"b-{stock}-{max_affordable}"], 1)
 
-                            new_holdings = dict(holdings)
-                            new_holdings[stock] = (
-                                new_holdings.get(stock, 0) + max_affordable
-                            )
-
-                            dfs(
-                                year,
-                                curr_energy,
-                                curr_cap - cost,
-                                new_holdings,
-                                new_timeline,
-                                path + [f"b-{stock}-{max_affordable}"],
-                                1,
-                            )
+                                # Backtrack
+                                holdings[stock] -= max_affordable
+                                info["qty"] += max_affordable
 
                     # Move to Jump phase
                     dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 2)
 
-                # PHASE 2: Jump to another year (Energy strictly decreases)
+                # PHASE 2: Jump to another timeline year
                 elif phase == 2:
                     for target_str in timeline.keys():
                         target_year = int(target_str)
@@ -274,15 +254,7 @@ def solve_stonks():
 
                         cost = abs(year - target_year)
                         if curr_energy >= cost + abs(target_year - 2037):
-                            dfs(
-                                target_year,
-                                curr_energy - cost,
-                                curr_cap,
-                                holdings,
-                                timeline_state,
-                                path + [f"j-{year}-{target_year}"],
-                                0,
-                            )
+                            dfs(target_year, curr_energy - cost, curr_cap, holdings, timeline_state, path + [f"j-{year}-{target_year}"], 0)
 
             dfs(2037, energy, capital, {}, timeline, [], phase=0)
             best_paths.append(best_path)
@@ -290,6 +262,5 @@ def solve_stonks():
         return jsonify(best_paths), 200
 
     except Exception as e:
-        # Capture tracebacks in application logs rather than returning generic 500
         print("Error processing request:", traceback.format_exc())
         return jsonify({"error": str(e)}), 500
