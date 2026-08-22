@@ -27,14 +27,14 @@ async def move():
         return {"action": "raise", "amount": raise_amount}
 
     # 2. Strong Hands / Calls
-    if has_pair or (your_number >= 10):
+    if has_pair or (your_number >= 9):
         if "call" in legal_actions:
             return {"action": "call"}
         if "check" in legal_actions:
             return {"action": "check"}
 
     # 3. Moderate Hands (6-9): Free play or small call
-    if your_number >= 6:
+    if your_number >= 5:
         if "check" in legal_actions:
             return {"action": "check"}
         if "call" in legal_actions and to_call <= 10:
