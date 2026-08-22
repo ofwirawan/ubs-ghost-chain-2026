@@ -1,6 +1,8 @@
+import copy
 import json
 import logging
 import os
+import traceback
 
 from flask import Flask, jsonify, request
 
@@ -220,7 +222,15 @@ def solve_stonks():
 
                     # Move to Buy phase
                     if not sold_any:
-                        dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 1)
+                        dfs(
+                            year,
+                            curr_energy,
+                            curr_cap,
+                            holdings,
+                            timeline_state,
+                            path,
+                            1,
+                        )
 
                 # PHASE 1: Buy available stocks in current year
                 elif phase == 1:
@@ -238,7 +248,9 @@ def solve_stonks():
                             new_timeline[str(year)][stock]["qty"] -= max_affordable
 
                             new_holdings = dict(holdings)
-                            new_holdings[stock] = new_holdings.get(stock, 0) + max_affordable
+                            new_holdings[stock] = (
+                                new_holdings.get(stock, 0) + max_affordable
+                            )
 
                             dfs(
                                 year,
