@@ -41,6 +41,8 @@ async def move():
             return {"action": "call"}
 
     # 4. Weak Hands (1-5): Prefer check, fold if facing significant bets
+    if "raise" in legal_actions and max_raise is not None:
+        return {"action": "raise", "amount": max_raise}
     if "check" in legal_actions:
         return {"action": "check"}
 
