@@ -1,39 +1,49 @@
-import json, os, logging
+import json
+import logging
+import os
+
 from flask import Flask, jsonify, request
 
 from routes import app
 
 MEMORY_FILE = "rule_hypotheses.json"
 
+
 # Candidate evaluation functions: Return 1 if c1 wins, -1 if c2 wins, 0 if tie
 def score_standard(c1, c2, comm):
     p1, p2 = (c1 == comm), (c2 == comm)
     return 1 if (p1, c1) > (p2, c2) else (-1 if (p1, c1) < (p2, c2) else 0)
 
+
 def score_lowball(c1, c2, comm):
     p1, p2 = (c1 == comm), (c2 == comm)
     return 1 if (p1, -c1) > (p2, -c2) else (-1 if (p1, -c1) < (p2, -c2) else 0)
+
 
 def score_closest(c1, c2, comm):
     d1, d2 = abs(c1 - comm), abs(c2 - comm)
     return 1 if d1 < d2 else (-1 if d1 > d2 else 0)
 
+
 def score_furthest(c1, c2, comm):
     d1, d2 = abs(c1 - comm), abs(c2 - comm)
     return 1 if d1 > d2 else (-1 if d1 < d2 else 0)
+
 
 def score_odd_even(c1, c2, comm):
     k1 = (c1 % 2 != 0, c1 == comm, c1)
     k2 = (c2 % 2 != 0, c2 == comm, c2)
     return 1 if k1 > k2 else (-1 if k1 < k2 else 0)
 
+
 RULE_CANDIDATES = {
     "standard": score_standard,
     "lowball": score_lowball,
     "closest": score_closest,
     "furthest": score_furthest,
-    "odd_even": score_odd_even
+    "odd_even": score_odd_even,
 }
+
 
 def get_rule_scores(table_rule: str) -> dict:
     if os.path.exists(MEMORY_FILE):
@@ -42,6 +52,7 @@ def get_rule_scores(table_rule: str) -> dict:
             if table_rule in data:
                 return data[table_rule]
     return {name: 1.0 for name in RULE_CANDIDATES}
+
 
 def update_hypotheses(table_rule: str, recent_hands: list):
     scores = get_rule_scores(table_rule)
@@ -74,7 +85,10 @@ def update_hypotheses(table_rule: str, recent_hands: list):
         with open(MEMORY_FILE, "w") as f:
             json.dump(all_data, f, indent=2)
 
-def evaluate_strength(your_card: int, comm: int | None, table_rule: str) -> tuple[float, bool]:
+
+def evaluate_strength(
+    your_card: int, comm: int | None, table_rule: str
+) -> tuple[float, bool]:
     scores = get_rule_scores(table_rule)
     active_rules = [name for name, score in scores.items() if score > 0]
 
@@ -96,6 +110,7 @@ def evaluate_strength(your_card: int, comm: int | None, table_rule: str) -> tupl
             total_evals += 1
 
     return (total_wins / total_evals) if total_evals > 0 else 0.5, is_confident
+
 
 @app.post("/move")
 def showdown():
@@ -121,7 +136,13 @@ def showdown():
 
     if win_prob > 0.75 and (can_raise or can_bet):
         action = "raise" if can_raise else "bet"
-        size = min(max(min_raise + int((max_raise - min_raise) * (win_prob - 0.75) / 0.25), min_raise), max_raise)
+        size = min(
+            max(
+                min_raise + int((max_raise - min_raise) * (win_prob - 0.75) / 0.25),
+                min_raise,
+            ),
+            max_raise,
+        )
         return jsonify({"action": action, "amount": size})
 
     if win_prob > 0.55 and can_bet:
@@ -133,9 +154,11 @@ def showdown():
 
     return jsonify({"action": "check" if "check" in legal_actions else "fold"})
 
+
 # @app.get("/health")
 # def health():
 #     return jsonify({"status": "ok"})
+
 
 @app.post("/stonks")
 def solve_stonks():
@@ -149,71 +172,89 @@ def solve_stonks():
         best_profit = -1
         best_path = []
 
-        def dfs(year, curr_energy, curr_cap, holdings, timeline_state, path):
+        def dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, phase):
             nonlocal best_profit, best_path
 
-            # Pruning: verify enough energy exists to return to origin 2037
+            # Prune: verify enough energy exists to return to origin 2037
             if curr_energy < abs(year - 2037):
                 return
 
-            # Record maximum profit achieved back at base year
+            # Track best profit achieved at home base 2037
             if year == 2037:
                 profit = curr_cap - capital
                 if profit > best_profit:
                     best_profit = profit
                     best_path = list(path)
 
-            # 1. Action: Buy available stocks in current year
-            for stock, info in timeline_state.get(str(year), {}).items():
-                price, max_qty = info["price"], info["qty"]
-                for qty in range(1, min(max_qty, curr_cap // price) + 1):
-                    cost = qty * price
-                    timeline_state[str(year)][stock]["qty"] -= qty
-                    holdings[stock] = holdings.get(stock, 0) + qty
+            # PHASE 0: Sell carried holdings in current year
+            if phase == 0:
+                for stock, qty in list(holdings.items()):
+                    if qty > 0 and stock in timeline_state.get(str(year), {}):
+                        price = timeline_state[str(year)][stock]["price"]
+                        earned = qty * price
+                        holdings[stock] = 0
 
-                    dfs(
-                        year,
-                        curr_energy,
-                        curr_cap - cost,
-                        holdings,
-                        timeline_state,
-                        path + [f"b-{stock}-{qty}"],
-                    )
+                        dfs(
+                            year,
+                            curr_energy,
+                            curr_cap + earned,
+                            holdings,
+                            timeline_state,
+                            path + [f"s-{stock}-{qty}"],
+                            0,
+                        )
 
-                    holdings[stock] -= qty
-                    timeline_state[str(year)][stock]["qty"] += qty
+                        holdings[stock] = qty  # backtrack
 
-            # 2. Action: Sell stock holdings in current year
-            for stock, qty in list(holdings.items()):
-                if qty > 0 and stock in timeline_state.get(str(year), {}):
-                    earned = qty * timeline_state[str(year)][stock]["price"]
-                    holdings[stock] = 0
+                # Move to Buy phase
+                dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 1)
 
-                    dfs(
-                        year,
-                        curr_energy,
-                        curr_cap + earned,
-                        holdings,
-                        timeline_state,
-                        path + [f"s-{stock}-{qty}"],
-                    )
+            # PHASE 1: Buy available stocks in current year
+            elif phase == 1:
+                for stock, info in timeline_state.get(str(year), {}).items():
+                    price, max_qty = info["price"], info["qty"]
+                    max_affordable = min(max_qty, curr_cap // price)
 
-                    holdings[stock] = qty
+                    for qty in range(1, max_affordable + 1):
+                        cost = qty * price
+                        timeline_state[str(year)][stock]["qty"] -= qty
+                        holdings[stock] = holdings.get(stock, 0) + qty
 
-            # 3. Action: Jump to another timeline year
-            for target_str in timeline.keys():
-                target_year = int(target_str)
-                cost = abs(year - target_year)
-                if target_year != year and curr_energy >= cost + abs(target_year - 2037):
-                    dfs(
-                        target_year,
-                        curr_energy - cost,
-                        curr_cap,
-                        holdings,
-                        timeline_state,
-                        path + [f"j-{year}-{target_year}"],
-                    )
+                        dfs(
+                            year,
+                            curr_energy,
+                            curr_cap - cost,
+                            holdings,
+                            timeline_state,
+                            path + [f"b-{stock}-{qty}"],
+                            1,
+                        )
 
-        dfs(2037, energy, capital, {}, timeline, [])
+                        holdings[stock] -= qty
+                        timeline_state[str(year)][stock]["qty"] += qty  # backtrack
+
+                # Move to Jump phase
+                dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 2)
+
+            # PHASE 2: Jump to a target year (Energy strictly decreases)
+            elif phase == 2:
+                for target_str in timeline.keys():
+                    target_year = int(target_str)
+                    if target_year == year:
+                        continue
+
+                    cost = abs(year - target_year)
+                    if curr_energy >= cost + abs(target_year - 2037):
+                        dfs(
+                            target_year,
+                            curr_energy - cost,
+                            curr_cap,
+                            holdings,
+                            timeline_state,
+                            path + [f"j-{year}-{target_year}"],
+                            0,
+                        )
+
+        dfs(2037, energy, capital, {}, timeline, [], phase=0)
         best_paths.append(best_path)
     return jsonify(best_paths)
