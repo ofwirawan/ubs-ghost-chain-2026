@@ -178,22 +178,39 @@ def solve_stonks():
             capital = data["capital"]
             timeline = data["timeline"]
 
+            # Flatten timeline into fast flat dictionaries
+            prices = {}
+            initial_avail = {}
+            all_years = []
+
+            for y_str, stocks in timeline.items():
+                y_int = int(y_str)
+                all_years.append(y_int)
+                for s_name, s_info in stocks.items():
+                    prices[(y_str, s_name)] = s_info["price"]
+                    initial_avail[(y_str, s_name)] = s_info["qty"]
+
             best_profit = -1
             best_path = []
             memo = {}
 
-            def dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, phase):
-                nonlocal best_profit, best_path
+            # Stack State: (year, curr_energy, curr_cap, holdings, avail, path, phase)
+            stack = [(2037, energy, capital, {}, initial_avail, [], 0)]
+
+            while stack:
+                year, curr_energy, curr_cap, holdings, avail, path, phase = stack.pop()
 
                 # Prune: verify enough energy exists to return to 2037
                 if curr_energy < abs(year - 2037):
-                    return
+                    continue
 
-                # State Memoization Pruning (Prunes paths that arrive with <= capital)
+                # Memoization Pruning
                 frozen_holdings = tuple(sorted((k, v) for k, v in holdings.items() if v > 0))
-                state_key = (year, curr_energy, phase, frozen_holdings)
+                frozen_avail = tuple(sorted(avail.items()))
+                state_key = (year, curr_energy, phase, frozen_holdings, frozen_avail)
+
                 if memo.get(state_key, -1) >= curr_cap:
-                    return
+                    continue
                 memo[state_key] = curr_cap
 
                 # Record maximum profit achieved at origin year 2037
@@ -203,60 +220,80 @@ def solve_stonks():
                         best_profit = profit
                         best_path = list(path)
 
-                # PHASE 0: Sell carried holdings
-                if phase == 0:
-                    sold_any = False
-                    for stock, qty in list(holdings.items()):
-                        if qty > 0 and stock in timeline_state.get(str(year), {}):
-                            price = timeline_state[str(year)][stock]["price"]
-                            earned = qty * price
+                y_str = str(year)
 
-                            # Sell in-place
-                            holdings[stock] = 0
-                            sold_any = True
-
-                            dfs(year, curr_energy, curr_cap + earned, holdings, timeline_state, path + [f"s-{stock}-{qty}"], 0)
-
-                            # Backtrack
-                            holdings[stock] = qty
-
-                    if not sold_any:
-                        dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 1)
+                # PHASE 2: Jump to another timeline year
+                if phase == 2:
+                    for target_year in all_years:
+                        if target_year == year:
+                            continue
+                        cost = abs(year - target_year)
+                        if curr_energy >= cost + abs(target_year - 2037):
+                            stack.append((
+                                target_year,
+                                curr_energy - cost,
+                                curr_cap,
+                                holdings,
+                                avail,
+                                path + [f"j-{year}-{target_year}"],
+                                0
+                            ))
 
                 # PHASE 1: Buy available stocks
                 elif phase == 1:
-                    for stock, info in timeline_state.get(str(year), {}).items():
-                        price, max_qty = info["price"], info["qty"]
-                        if price > 0 and max_qty > 0:
-                            max_affordable = min(max_qty, curr_cap // price)
-                            if max_affordable > 0:
-                                cost = max_affordable * price
+                    # Next transition step: move to Jump phase
+                    stack.append((year, curr_energy, curr_cap, holdings, avail, path, 2))
 
-                                # Buy in-place
-                                info["qty"] -= max_affordable
-                                holdings[stock] = holdings.get(stock, 0) + max_affordable
+                    for (s_year, stock), rem_qty in avail.items():
+                        if s_year == y_str and rem_qty > 0:
+                            price = prices.get((y_str, stock), 0)
+                            if price > 0:
+                                max_affordable = min(rem_qty, curr_cap // price)
+                                if max_affordable > 0:
+                                    cost = max_affordable * price
 
-                                dfs(year, curr_energy, curr_cap - cost, holdings, timeline_state, path + [f"b-{stock}-{max_affordable}"], 1)
+                                    new_avail = avail.copy()
+                                    new_avail[(y_str, stock)] -= max_affordable
 
-                                # Backtrack
-                                holdings[stock] -= max_affordable
-                                info["qty"] += max_affordable
+                                    new_holdings = holdings.copy()
+                                    new_holdings[stock] = new_holdings.get(stock, 0) + max_affordable
 
-                    # Move to Jump phase
-                    dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 2)
+                                    stack.append((
+                                        year,
+                                        curr_energy,
+                                        curr_cap - cost,
+                                        new_holdings,
+                                        new_avail,
+                                        path + [f"b-{stock}-{max_affordable}"],
+                                        1
+                                    ))
 
-                # PHASE 2: Jump to another timeline year
-                elif phase == 2:
-                    for target_str in timeline.keys():
-                        target_year = int(target_str)
-                        if target_year == year:
-                            continue
+                # PHASE 0: Sell carried holdings
+                elif phase == 0:
+                    sold_any = False
+                    for stock, qty in list(holdings.items()):
+                        if qty > 0 and (y_str, stock) in prices:
+                            price = prices[(y_str, stock)]
+                            earned = qty * price
 
-                        cost = abs(year - target_year)
-                        if curr_energy >= cost + abs(target_year - 2037):
-                            dfs(target_year, curr_energy - cost, curr_cap, holdings, timeline_state, path + [f"j-{year}-{target_year}"], 0)
+                            new_holdings = holdings.copy()
+                            new_holdings[stock] = 0
+                            sold_any = True
 
-            dfs(2037, energy, capital, {}, timeline, [], phase=0)
+                            stack.append((
+                                year,
+                                curr_energy,
+                                curr_cap + earned,
+                                new_holdings,
+                                avail,
+                                path + [f"s-{stock}-{qty}"],
+                                0
+                            ))
+
+                    if not sold_any:
+                        # Move to Buy phase
+                        stack.append((year, curr_energy, curr_cap, holdings, avail, path, 1))
+
             best_paths.append(best_path)
 
         return jsonify(best_paths), 200
