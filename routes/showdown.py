@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 from routes import app
 
-@app.get("/health")
+@app.route("/health", methods=["POST"])
 def health_check():
     return {"status": "ok"}
 
