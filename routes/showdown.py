@@ -162,99 +162,122 @@ def showdown():
 
 @app.post("/stonks")
 def solve_stonks():
-    datas = request.get_json()
-    best_paths = []
-    for data in datas:
-        energy = data["energy"]
-        capital = data["capital"]
-        timeline = data["timeline"]
+    try:
+        # Force JSON parsing even if headers are missing or non-standard
+        datas = request.get_json(force=True, silent=True)
 
-        best_profit = -1
-        best_path = []
+        if datas is None:
+            return jsonify({"error": "Invalid or missing JSON payload"}), 400
 
-        def dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, phase):
-            nonlocal best_profit, best_path
+        if isinstance(datas, dict):
+            datas = [datas]
 
-            # Prune: verify enough energy exists to return to origin 2037
-            if curr_energy < abs(year - 2037):
-                return
+        best_paths = []
 
-            # Track best profit achieved at home base 2037
-            if year == 2037:
-                profit = curr_cap - capital
-                if profit > best_profit:
-                    best_profit = profit
-                    best_path = list(path)
+        for data in datas:
+            energy = data["energy"]
+            capital = data["capital"]
+            timeline = data["timeline"]
 
-            # PHASE 0: Sell carried holdings in current year
-            if phase == 0:
-                for stock, qty in list(holdings.items()):
-                    if qty > 0 and stock in timeline_state.get(str(year), {}):
-                        price = timeline_state[str(year)][stock]["price"]
-                        earned = qty * price
-                        holdings[stock] = 0
+            best_profit = -1
+            best_path = []
 
-                        dfs(
-                            year,
-                            curr_energy,
-                            curr_cap + earned,
-                            holdings,
-                            timeline_state,
-                            path + [f"s-{stock}-{qty}"],
-                            0,
-                        )
+            def dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, phase):
+                nonlocal best_profit, best_path
 
-                        holdings[stock] = qty  # backtrack
+                # Prune: verify enough energy exists to return home to 2037
+                if curr_energy < abs(year - 2037):
+                    return
 
-                # Move to Buy phase
-                dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 1)
+                # Record best profit achieved back at 2037
+                if year == 2037:
+                    profit = curr_cap - capital
+                    if profit > best_profit:
+                        best_profit = profit
+                        best_path = list(path)
 
-            # PHASE 1: Buy available stocks in current year
-            elif phase == 1:
-                for stock, info in timeline_state.get(str(year), {}).items():
-                    price, max_qty = info["price"], info["qty"]
-                    max_affordable = min(max_qty, curr_cap // price)
+                # PHASE 0: Sell carried holdings in current year
+                if phase == 0:
+                    sold_any = False
+                    for stock, qty in list(holdings.items()):
+                        if qty > 0 and stock in timeline_state.get(str(year), {}):
+                            price = timeline_state[str(year)][stock]["price"]
+                            earned = qty * price
 
-                    for qty in range(1, max_affordable + 1):
-                        cost = qty * price
-                        timeline_state[str(year)][stock]["qty"] -= qty
-                        holdings[stock] = holdings.get(stock, 0) + qty
+                            new_holdings = dict(holdings)
+                            new_holdings[stock] = 0
 
-                        dfs(
-                            year,
-                            curr_energy,
-                            curr_cap - cost,
-                            holdings,
-                            timeline_state,
-                            path + [f"b-{stock}-{qty}"],
-                            1,
-                        )
+                            sold_any = True
+                            dfs(
+                                year,
+                                curr_energy,
+                                curr_cap + earned,
+                                new_holdings,
+                                timeline_state,
+                                path + [f"s-{stock}-{qty}"],
+                                0,
+                            )
 
-                        holdings[stock] -= qty
-                        timeline_state[str(year)][stock]["qty"] += qty  # backtrack
+                    # Move to Buy phase
+                    if not sold_any:
+                        dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 1)
 
-                # Move to Jump phase
-                dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 2)
+                # PHASE 1: Buy available stocks in current year
+                elif phase == 1:
+                    bought_any = False
+                    for stock, info in timeline_state.get(str(year), {}).items():
+                        price, max_qty = info["price"], info["qty"]
+                        max_affordable = min(max_qty, curr_cap // price)
 
-            # PHASE 2: Jump to a target year (Energy strictly decreases)
-            elif phase == 2:
-                for target_str in timeline.keys():
-                    target_year = int(target_str)
-                    if target_year == year:
-                        continue
+                        # Test max_affordable to prevent branching explosion
+                        if max_affordable > 0:
+                            bought_any = True
+                            cost = max_affordable * price
 
-                    cost = abs(year - target_year)
-                    if curr_energy >= cost + abs(target_year - 2037):
-                        dfs(
-                            target_year,
-                            curr_energy - cost,
-                            curr_cap,
-                            holdings,
-                            timeline_state,
-                            path + [f"j-{year}-{target_year}"],
-                            0,
-                        )
+                            new_timeline = copy.deepcopy(timeline_state)
+                            new_timeline[str(year)][stock]["qty"] -= max_affordable
 
-        dfs(2037, energy, capital, {}, timeline, [], phase=0)
-        best_paths.append(best_path)
-    return jsonify(best_paths)
+                            new_holdings = dict(holdings)
+                            new_holdings[stock] = new_holdings.get(stock, 0) + max_affordable
+
+                            dfs(
+                                year,
+                                curr_energy,
+                                curr_cap - cost,
+                                new_holdings,
+                                new_timeline,
+                                path + [f"b-{stock}-{max_affordable}"],
+                                1,
+                            )
+
+                    # Move to Jump phase
+                    dfs(year, curr_energy, curr_cap, holdings, timeline_state, path, 2)
+
+                # PHASE 2: Jump to another year (Energy strictly decreases)
+                elif phase == 2:
+                    for target_str in timeline.keys():
+                        target_year = int(target_str)
+                        if target_year == year:
+                            continue
+
+                        cost = abs(year - target_year)
+                        if curr_energy >= cost + abs(target_year - 2037):
+                            dfs(
+                                target_year,
+                                curr_energy - cost,
+                                curr_cap,
+                                holdings,
+                                timeline_state,
+                                path + [f"j-{year}-{target_year}"],
+                                0,
+                            )
+
+            dfs(2037, energy, capital, {}, timeline, [], phase=0)
+            best_paths.append(best_path)
+
+        return jsonify(best_paths), 200
+
+    except Exception as e:
+        # Capture tracebacks in application logs rather than returning generic 500
+        print("Error processing request:", traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
