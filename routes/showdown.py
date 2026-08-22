@@ -133,9 +133,9 @@ def showdown():
 
     return jsonify({"action": "check" if "check" in legal_actions else "fold"})
 
-@app.get("/health")
-def health():
-    return jsonify({"status": "ok"})
+# @app.get("/health")
+# def health():
+#     return jsonify({"status": "ok"})
 
 @app.post("/stonks")
 def solve_stonks():
