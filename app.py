@@ -76,9 +76,7 @@ class RiskEngine:
         return False
 
     @classmethod
-    def _count_simple_paths(
-        cls, graph: dict[str, set[str]], start: str, goal: str, max_depth: int = 5
-    ) -> int:
+    def _count_simple_paths(cls, graph: dict[str, set[str]], start: str, goal: str, max_depth: int = 5) -> int:
         total = 0
         stack = [(start, {start})]
         while stack and total < 5:
@@ -144,48 +142,63 @@ class RiskEngine:
             index += 1
         return components
 
-    def _identity_signal(
-        self, tx: dict[str, Any], records: list[Transaction], graph: dict[str, set[str]]
-    ) -> float:
-        source, target = tx["fromUserId"], tx["toUserId"]
+    def _identity_signal(self, tx: dict[str, Any], records: list[Transaction], graph: dict[str, set[str]]) -> float:
+        source = tx["fromUserId"]
         signal = 0.0
 
-        upstream_txs = [
-            r
-            for r in records
-            if r.target == source or self._reachable(graph, r.target, source)
-        ]
+        upstream_txs = [r for r in records if r.target == source or self._reachable(graph, r.target, source)]
         components = self._component(graph, set())
         current_comp = components.get(source)
 
         for field, attr in (("ipAddress", "ip"), ("deviceId", "device")):
             val = tx.get(field)
-            upstream_vals = {
-                getattr(r, attr) for r in upstream_txs if getattr(r, attr) is not None
-            }
+            upstream_vals = {getattr(r, attr) for r in upstream_txs if getattr(r, attr) is not None}
 
             if val is None:
                 if upstream_vals:
-                    signal += 0.08
+                    signal += 0.08  # Identifier omitted mid-stream
             else:
                 if upstream_vals and val not in upstream_vals:
-                    signal += 0.06
+                    signal += 0.06  # Mid-flow shift
 
                 matching_txs = [r for r in records if getattr(r, attr) == val]
                 if matching_txs:
-                    other_comps = {components.get(r.source) for r in matching_txs} | {
-                        components.get(r.target) for r in matching_txs
-                    }
+                    other_comps = {components.get(r.source) for r in matching_txs} | {components.get(r.target) for r in matching_txs}
                     other_comps.discard(current_comp)
                     other_comps.discard(None)
 
                     if other_comps:
                         has_flow_link = any(
-                            self._reachable(graph, r.source, source)
-                            or self._reachable(graph, source, r.source)
+                            self._reachable(graph, r.source, source) or self._reachable(graph, source, r.source)
                             for r in matching_txs
                         )
                         signal += 0.09 if has_flow_link else 0.03
+
+        return min(signal, 0.35)
+
+    def _value_signal(self, tx: dict[str, Any], records: list[Transaction]) -> float:
+        source = tx["fromUserId"]
+        amount = float(tx["amount"])
+
+        # Locate direct upstream legs entering the source node
+        incoming = [r for r in records if r.target == source]
+        if not incoming:
+            return 0.0
+
+        signal = 0.0
+        for in_tx in incoming:
+            if in_tx.amount <= 0:
+                continue
+
+            ratio = amount / in_tx.amount
+
+            # Value Trajectory Reversal: amount increases along an inferred flow segment
+            if ratio > 1.001:
+                reversal_penalty = min(0.20 + (ratio - 1.0) * 0.5, 0.35)
+                signal = max(signal, reversal_penalty)
+            # Unexplained abrupt drop without clear branching context
+            elif ratio < 0.40:
+                signal = max(signal, 0.04)
 
         return min(signal, 0.35)
 
@@ -197,9 +210,7 @@ class RiskEngine:
         if source == target:
             score += 0.50
 
-        existing_nodes = set(graph) | {
-            node for targets in graph.values() for node in targets
-        }
+        existing_nodes = set(graph) | {node for targets in graph.values() for node in targets}
         if source in existing_nodes or target in existing_nodes:
             score += 0.04
 
@@ -223,7 +234,10 @@ class RiskEngine:
             if (ancestors_source & ancestors_target) - {source}:
                 score += 0.12
 
+        # Combine Structural, Identity, and Value signals
         score += self._identity_signal(tx, records, graph)
+        score += self._value_signal(tx, records)
+
         return round(min(max(score, 0.0), 1.0), 6)
 
     def process(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -236,14 +250,8 @@ class RiskEngine:
                 if not isinstance(raw, dict):
                     raise ValueError("each transaction must be an object")
                 required = ("txId", "fromUserId", "toUserId", "amount", "createdAt")
-                if any(
-                    not isinstance(raw.get(k), str) or not raw.get(k)
-                    for k in required
-                    if k != "amount"
-                ):
-                    raise ValueError(
-                        "txId, fromUserId, toUserId, and createdAt are required strings"
-                    )
+                if any(not isinstance(raw.get(k), str) or not raw.get(k) for k in required if k != "amount"):
+                    raise ValueError("txId, fromUserId, toUserId, and createdAt are required strings")
                 try:
                     amount = float(raw["amount"])
                 except (TypeError, ValueError) as exc:
@@ -253,42 +261,15 @@ class RiskEngine:
                 created_at = parse_timestamp(raw["createdAt"])
                 self._expire(created_at)
                 existing = self.by_id.get(raw["txId"])
-                fingerprint = (
-                    raw["fromUserId"],
-                    raw["toUserId"],
-                    amount,
-                    created_at,
-                    raw.get("ipAddress"),
-                    raw.get("deviceId"),
-                )
+                fingerprint = (raw["fromUserId"], raw["toUserId"], amount, created_at, raw.get("ipAddress"), raw.get("deviceId"))
                 if existing:
-                    existing_fingerprint = (
-                        existing.source,
-                        existing.target,
-                        existing.amount,
-                        existing.created_at,
-                        existing.ip,
-                        existing.device,
-                    )
+                    existing_fingerprint = (existing.source, existing.target, existing.amount, existing.created_at, existing.ip, existing.device)
                     if fingerprint != existing_fingerprint:
-                        raise ValueError(
-                            f"txId {raw['txId']} was already submitted with a different payload"
-                        )
-                    results.append(
-                        {"txId": existing.tx_id, "riskScore": existing.score}
-                    )
+                        raise ValueError(f"txId {raw['txId']} was already submitted with a different payload")
+                    results.append({"txId": existing.tx_id, "riskScore": existing.score})
                     continue
                 score = self._score(raw, list(self.transactions))
-                record = Transaction(
-                    raw["txId"],
-                    raw["fromUserId"],
-                    raw["toUserId"],
-                    amount,
-                    created_at,
-                    raw.get("ipAddress"),
-                    raw.get("deviceId"),
-                    score,
-                )
+                record = Transaction(raw["txId"], raw["fromUserId"], raw["toUserId"], amount, created_at, raw.get("ipAddress"), raw.get("deviceId"), score)
                 self.transactions.append(record)
                 self.by_id[record.tx_id] = record
                 results.append({"txId": record.tx_id, "riskScore": score})
