@@ -1,7 +1,8 @@
 import json, os, logging
 from flask import Flask, jsonify, request
 
-app = Flask(__name__)
+from routes import app
+
 MEMORY_FILE = "rule_hypotheses.json"
 
 # Candidate evaluation functions: Return 1 if c1 wins, -1 if c2 wins, 0 if tie
