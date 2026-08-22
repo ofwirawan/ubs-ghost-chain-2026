@@ -139,7 +139,7 @@ def showdown():
 
 @app.post("/stonks")
 def solve_stonks():
-    data = request.get_json()
+    datas = request.get_json()
     best_paths = []
     for data in datas:
         energy = data["energy"]
